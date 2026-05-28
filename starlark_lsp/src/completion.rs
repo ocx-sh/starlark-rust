@@ -41,6 +41,7 @@ use crate::definition::Definition;
 use crate::definition::DottedDefinition;
 use crate::definition::IdentifierDefinition;
 use crate::definition::LspModule;
+use crate::dotted;
 use crate::exported::SymbolKind as ExportedSymbolKind;
 use crate::server::Backend;
 use crate::server::LspContext;
@@ -201,10 +202,14 @@ impl<T: LspContext> Backend<T> {
         previously_used_named_parameters: &[String],
         workspace_root: Option<&Path>,
     ) -> impl Iterator<Item = CompletionItem> {
-        match document.find_definition_at_location(
-            function_name_span.begin.line as u32,
-            function_name_span.begin.column as u32,
-        ) {
+        // For dotted calls like `m.f(...)`, looking up the definition at the
+        // *start* of the name span lands on the receiver (`m`), which is a
+        // namespace with no params. Look up just before the end of the name
+        // span instead so the lookup falls on the leaf attribute (`f`) and
+        // produces a `Definition::Dotted` we can walk.
+        let lookup_line = function_name_span.end.line as u32;
+        let lookup_column = function_name_span.end.column.saturating_sub(1) as u32;
+        match document.find_definition_at_location(lookup_line, lookup_column) {
             Definition::Identifier(identifier) => self
                 .parameter_name_options_for_identifier_definition(
                     &identifier,
@@ -216,16 +221,49 @@ impl<T: LspContext> Backend<T> {
                 .unwrap_or_default(),
             Definition::Dotted(DottedDefinition {
                 root_definition_location,
+                segments,
                 ..
-            }) => self
-                .parameter_name_options_for_identifier_definition(
+            }) => {
+                // Walk the dotted chain against the host environment to find
+                // the leaf function. If it resolves to a function, return its
+                // regular parameter names. Otherwise fall back to the legacy
+                // root-routed behavior — which historically returned the root
+                // identifier's params, i.e. nothing for namespace globals like
+                // `ocx`, but stays correct for callable bare globals.
+                let env = self.context.get_environment(document_uri);
+                let dotted_params = dotted::resolve_dotted_chain(
+                    &env,
                     &root_definition_location,
-                    document,
-                    document_uri,
-                    previously_used_named_parameters,
-                    workspace_root,
+                    &segments,
                 )
-                .unwrap_or_default(),
+                .and_then(|item| match item {
+                    DocItem::Member(DocMember::Function(doc_function)) => Some(
+                        doc_function
+                            .params
+                            .regular_params()
+                            .filter(|p| !previously_used_named_parameters.contains(&p.name))
+                            .map(|p| CompletionItem {
+                                label: p.name.to_owned(),
+                                kind: Some(CompletionItemKind::PROPERTY),
+                                ..Default::default()
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                });
+                match dotted_params {
+                    Some(params) => Some(params),
+                    None => self
+                        .parameter_name_options_for_identifier_definition(
+                            &root_definition_location,
+                            document,
+                            document_uri,
+                            previously_used_named_parameters,
+                            workspace_root,
+                        )
+                        .unwrap_or_default(),
+                }
+            }
         }
         .into_iter()
         .flatten()

@@ -68,8 +68,33 @@ pub enum AutocompleteType {
     },
     /// Offer completions of type names.
     Type,
+    /// Offer completions of members on a dotted-access receiver. Cursor is on
+    /// (or after) the dot in `obj.member`. The receiver is recorded as the
+    /// pure-identifier chain leading up to the cursor — e.g. for `ocx.run.<TAB>`
+    /// `receiver_segments` is `["ocx", "run"]`. A trailing partial identifier
+    /// at the cursor is exposed through `current_span` so the client can
+    /// substring-match against the listed members.
+    MemberAccess {
+        receiver_segments: Vec<String>,
+        current_span: ResolvedSpan,
+    },
     /// Don't offer any completions. Cursor is e.g. in a comment.
     None,
+}
+
+/// Walk a dotted-receiver expression left-to-right collecting identifier
+/// segments. Returns `None` for any node that is not a pure
+/// identifier-or-dot chain (e.g. `f().x` or `x[0].y`).
+fn collect_dotted_chain(expr: &AstExprP<AstNoPayload>) -> Option<Vec<String>> {
+    match &expr.node {
+        ExprP::Identifier(ident) => Some(vec![ident.node.ident.clone()]),
+        ExprP::Dot(receiver, attr) => {
+            let mut chain = collect_dotted_chain(receiver)?;
+            chain.push(attr.node.clone());
+            Some(chain)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) trait AstModuleInspect {
@@ -312,6 +337,32 @@ impl AstModuleInspect for AstModule {
                         current_value: str.to_string(),
                         current_span: string_span_without_quotes(codemap, span),
                     });
+                }
+                Visit::Expr(AstExprP {
+                    node: ExprP::Dot(receiver, attr),
+                    ..
+                }) => {
+                    // Cursor inside the receiver — recurse so completion handles
+                    // whatever sub-expression is under the cursor (e.g. a nested
+                    // call, a literal, …).
+                    if receiver.span.contains(position) {
+                        return walk_and_find_completion_type(
+                            codemap,
+                            position,
+                            Visit::Expr(receiver),
+                        );
+                    }
+                    // Otherwise the cursor is on the attribute (or just after
+                    // the dot). Emit `MemberAccess` if the receiver is a pure
+                    // identifier-or-dot chain. Non-identifier receivers like
+                    // `f().x` are not yet supported and fall back to the
+                    // generic walker.
+                    if let Some(receiver_segments) = collect_dotted_chain(receiver) {
+                        return Some(AutocompleteType::MemberAccess {
+                            receiver_segments,
+                            current_span: codemap.resolve_span(attr.span),
+                        });
+                    }
                 }
                 Visit::Stmt(stmt) => {
                     let mut result = None;

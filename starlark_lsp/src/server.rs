@@ -105,6 +105,7 @@ use crate::definition::Definition;
 use crate::definition::DottedDefinition;
 use crate::definition::IdentifierDefinition;
 use crate::definition::LspModule;
+use crate::dotted;
 use crate::inspect::AstModuleInspect;
 use crate::inspect::AutocompleteType;
 use crate::symbols::find_symbols_at_location;
@@ -805,6 +806,10 @@ impl<T: LspContext> Backend<T> {
                         .collect(),
                     ),
                     Some(AutocompleteType::Type) => Some(Self::type_completion_options().collect()),
+                    Some(AutocompleteType::MemberAccess {
+                        receiver_segments,
+                        ..
+                    }) => Some(self.member_completion_options(&uri, receiver_segments)),
                 }
             }
             None => None,
@@ -901,6 +906,63 @@ impl<T: LspContext> Backend<T> {
         }
 
         result
+    }
+
+    /// Build completion items for the children of a dotted-access receiver.
+    ///
+    /// `receiver_segments` is the pure-identifier chain leading up to the
+    /// cursor — e.g. for `ocx.run.<TAB>` it is `["ocx", "run"]`. The walker
+    /// resolves the chain against the host environment via
+    /// [`dotted::resolve_dotted_chain`] and emits one [`CompletionItem`] per
+    /// child of the resolved item. Returns an empty list when the chain does
+    /// not resolve or the leaf has no children to list (e.g. it is already a
+    /// terminal function/property).
+    pub(crate) fn member_completion_options(
+        &self,
+        current_document: &LspUrl,
+        receiver_segments: &[String],
+    ) -> Vec<CompletionItem> {
+        let env = self.context.get_environment(current_document);
+        let Some(root_name) = receiver_segments.first() else {
+            return Vec::new();
+        };
+        // Synthesize the root identifier as an "Unresolved" global — the same
+        // shape that `find_definition_at_location` produces for top-level
+        // bindings supplied by the host environment.
+        let root = IdentifierDefinition::Unresolved {
+            source: ResolvedSpan::default(),
+            name: root_name.clone(),
+        };
+        let Some(item) = dotted::resolve_dotted_chain(&env, &root, receiver_segments) else {
+            return Vec::new();
+        };
+        let Some(children) = dotted::list_children(&item) else {
+            return Vec::new();
+        };
+        let label_prefix = receiver_segments.join(".");
+        children
+            .into_iter()
+            .map(|(name, member)| {
+                let kind = match &member {
+                    DocMember::Function(_) => CompletionItemKind::FUNCTION,
+                    DocMember::Property(_) => CompletionItemKind::PROPERTY,
+                };
+                let doc_item = DocItem::Member(member);
+                CompletionItem {
+                    label: name.to_owned(),
+                    kind: Some(kind),
+                    detail: doc_item.get_doc_summary().map(str::to_owned),
+                    documentation: Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: render_doc_item_no_link(
+                            &format!("{label_prefix}.{name}"),
+                            &doc_item,
+                        ),
+                    })),
+                    ..Default::default()
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn get_global_symbol_completion_items(
@@ -1038,16 +1100,38 @@ impl<T: LspContext> Backend<T> {
                         )?,
                     Definition::Dotted(DottedDefinition {
                         root_definition_location,
-                        ..
+                        segments,
+                        source,
                     }) => {
-                        // Not something we really support yet, so just provide hover information for
-                        // the root definition.
-                        self.get_hover_for_identifier_definition(
-                            root_definition_location,
-                            &document,
-                            &uri,
-                            workspace_root.as_deref(),
-                        )?
+                        // Walk the dotted chain against the host environment.
+                        // On success, render the leaf `DocItem` directly so
+                        // hover shows e.g. `ocx.run`'s signature rather than
+                        // `ocx`'s namespace docs. On failure (unresolved root,
+                        // walk into a non-module), fall back to the legacy
+                        // root-identifier behavior so the user still sees
+                        // *something*.
+                        let env = self.context.get_environment(&uri);
+                        match dotted::resolve_dotted_chain(
+                            &env,
+                            &root_definition_location,
+                            &segments,
+                        ) {
+                            Some(item) => {
+                                let label = segments.join(".");
+                                Some(Hover {
+                                    contents: HoverContents::Array(vec![MarkedString::String(
+                                        render_doc_item_no_link(&label, &item),
+                                    )]),
+                                    range: Some(source.into()),
+                                })
+                            }
+                            None => self.get_hover_for_identifier_definition(
+                                root_definition_location,
+                                &document,
+                                &uri,
+                                workspace_root.as_deref(),
+                            )?,
+                        }
                     }
                 }
                 .unwrap_or(not_found)
@@ -2507,5 +2591,197 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Tests for dotted-access completion / hover / param-name completion.
+    mod dotted {
+        use lsp_types::request::Completion;
+        use lsp_types::request::HoverRequest;
+        use lsp_types::CompletionItem;
+        use lsp_types::CompletionItemKind;
+        use lsp_types::CompletionParams;
+        use lsp_types::CompletionResponse;
+        use lsp_types::Hover;
+        use lsp_types::HoverContents;
+        use lsp_types::HoverParams;
+        use lsp_types::MarkedString;
+        use lsp_types::Position;
+        use lsp_types::TextDocumentIdentifier;
+        use lsp_types::TextDocumentPositionParams;
+        use lsp_types::Url;
+        use starlark::docs::DocFunction;
+        use starlark::docs::DocItem;
+        use starlark::docs::DocMember;
+        use starlark::docs::DocModule;
+        use starlark::docs::DocParam;
+        use starlark::docs::DocParams;
+        use starlark::docs::DocString;
+        use starlark::docs::DocStringKind;
+        use starlark::typing::Ty;
+        use starlark::wasm::is_wasm;
+
+        use crate::test::TestServer;
+
+        use super::temp_file_uri;
+
+        /// Synthetic host environment: top-level module `m` with a member
+        /// function `f(a, b)` whose docstring is `"runs the thing"`.
+        fn environment() -> DocModule {
+            let f = DocFunction {
+                docs: DocString::from_docstring(DocStringKind::Starlark, "runs the thing"),
+                params: DocParams {
+                    pos_or_named: vec![
+                        DocParam {
+                            name: "a".to_owned(),
+                            docs: None,
+                            typ: Ty::any(),
+                            default_value: None,
+                        },
+                        DocParam {
+                            name: "b".to_owned(),
+                            docs: None,
+                            typ: Ty::any(),
+                            default_value: None,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                ret: Default::default(),
+            };
+            let inner = DocModule {
+                docs: None,
+                members: [(
+                    "f".to_owned(),
+                    DocItem::Member(DocMember::Function(f)),
+                )]
+                .into_iter()
+                .collect(),
+            };
+            DocModule {
+                docs: None,
+                members: [("m".to_owned(), DocItem::Module(inner))]
+                    .into_iter()
+                    .collect(),
+            }
+        }
+
+        fn completion_request(
+            server: &mut TestServer,
+            uri: Url,
+            line: u32,
+            character: u32,
+        ) -> lsp_server::Request {
+            server.new_request::<Completion>(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position { line, character },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+        }
+
+        fn completion_items(
+            server: &mut TestServer,
+            request: lsp_server::Request,
+        ) -> anyhow::Result<Vec<CompletionItem>> {
+            let request_id = server.send_request(request)?;
+            let response = server.get_response::<CompletionResponse>(request_id)?;
+            Ok(match response {
+                CompletionResponse::Array(items) => items,
+                CompletionResponse::List(list) => list.items,
+            })
+        }
+
+        #[test]
+        fn dotted_completion_lists_members() -> anyhow::Result<()> {
+            if is_wasm() {
+                return Ok(());
+            }
+            let uri = temp_file_uri("dotted_completion.star");
+            let mut server = TestServer::new_with_environment(environment())?;
+            // `m.x` is a valid Dot expression; cursor on `x` (column 2)
+            // is inside the attribute span, which fires `MemberAccess`. This
+            // models the realistic editor sequence: user typed `m.`, then
+            // started typing a partial attribute name.
+            server.open_file(uri.clone(), "m.x\n".to_owned())?;
+
+            let req = completion_request(&mut server, uri, 0, 2);
+            let items = completion_items(&mut server, req)?;
+
+            assert!(
+                items.iter().any(|i| i.label == "f"
+                    && i.kind == Some(CompletionItemKind::FUNCTION)),
+                "expected `f` in completion items, got: {items:?}"
+            );
+            assert!(
+                items.iter().all(|i| i.label != "m"),
+                "did not expect the receiver `m` itself in completion items, got: {items:?}"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn dotted_hover_resolves_leaf() -> anyhow::Result<()> {
+            if is_wasm() {
+                return Ok(());
+            }
+            let uri = temp_file_uri("dotted_hover.star");
+            let mut server = TestServer::new_with_environment(environment())?;
+            server.open_file(uri.clone(), "m.f\n".to_owned())?;
+
+            let request = server.new_request::<HoverRequest>(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position {
+                        line: 0,
+                        character: 2,
+                    },
+                },
+                work_done_progress_params: Default::default(),
+            });
+            let request_id = server.send_request(request)?;
+            let response = server.get_response::<Hover>(request_id)?;
+            let rendered = match response.contents {
+                HoverContents::Array(items) => items
+                    .into_iter()
+                    .map(|s| match s {
+                        MarkedString::String(s) => s,
+                        MarkedString::LanguageString(ls) => ls.value,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                HoverContents::Scalar(MarkedString::String(s)) => s,
+                HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
+                HoverContents::Markup(markup) => markup.value,
+            };
+            assert!(
+                rendered.contains("runs the thing"),
+                "expected leaf docstring in hover, got: {rendered:?}"
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn dotted_param_name_completion() -> anyhow::Result<()> {
+            if is_wasm() {
+                return Ok(());
+            }
+            let uri = temp_file_uri("dotted_params.star");
+            let mut server = TestServer::new_with_environment(environment())?;
+            // Cursor sits just inside the empty argument list of `m.f(...)`.
+            server.open_file(uri.clone(), "m.f()\n".to_owned())?;
+
+            let req = completion_request(&mut server, uri, 0, 4);
+            let items = completion_items(&mut server, req)?;
+
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+            assert!(
+                labels.contains(&"a") && labels.contains(&"b"),
+                "expected `a` and `b` param names, got: {labels:?}"
+            );
+            Ok(())
+        }
     }
 }

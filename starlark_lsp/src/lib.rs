@@ -25,6 +25,7 @@ mod bind;
 pub mod completion;
 mod definition;
 pub(crate) mod docs;
+pub(crate) mod dotted;
 pub mod error;
 mod exported;
 pub(crate) mod inspect;

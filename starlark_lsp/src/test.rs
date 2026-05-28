@@ -120,6 +120,11 @@ struct TestServerContext {
     dirs: Arc<RwLock<HashSet<PathBuf>>>,
     builtin_docs: Arc<HashMap<LspUrl, String>>,
     builtin_symbols: Arc<HashMap<String, LspUrl>>,
+    /// Optional override for `get_environment`. When set, `get_environment`
+    /// returns this `DocModule` instead of the flat set synthesized from
+    /// `builtin_symbols`. Used by dotted-completion / hover / param-name
+    /// tests that need nested host namespaces.
+    environment_override: Option<Arc<DocModule>>,
 }
 
 impl LspContext for TestServerContext {
@@ -283,6 +288,9 @@ impl LspContext for TestServerContext {
     }
 
     fn get_environment(&self, _uri: &LspUrl) -> DocModule {
+        if let Some(env) = &self.environment_override {
+            return (**env).clone();
+        }
         DocModule {
             docs: None,
             members: self
@@ -404,6 +412,15 @@ impl TestServer {
     /// initialization payload and makes sure that when the server is dropped, the threads
     /// are attempted to be stopped.
     pub(crate) fn new_with_settings(settings: Option<LspServerSettings>) -> anyhow::Result<Self> {
+        Self::new_with_settings_and_env(settings, None)
+    }
+
+    /// As `new_with_settings`, but also accepts an override `DocModule` for
+    /// the `get_environment` host environment. Used by dotted-access tests.
+    pub(crate) fn new_with_settings_and_env(
+        settings: Option<LspServerSettings>,
+        environment_override: Option<DocModule>,
+    ) -> anyhow::Result<Self> {
         let (server_connection, client_connection) = Connection::memory();
 
         let builtin = Self::testing_builtins(&std::env::current_dir()?)?;
@@ -434,6 +451,7 @@ impl TestServer {
             dirs: dirs.dupe(),
             builtin_docs: builtin_docs.dupe(),
             builtin_symbols,
+            environment_override: environment_override.map(Arc::new),
         };
 
         let server_thread = std::thread::spawn(|| {
@@ -462,6 +480,12 @@ impl TestServer {
     /// sure that when the server is dropped, the threads are attempted to be stopped.
     pub(crate) fn new() -> anyhow::Result<Self> {
         Self::new_with_settings(None)
+    }
+
+    /// Create and start a new LSP server with a custom host environment. The
+    /// `environment` is returned verbatim from `LspContext::get_environment`.
+    pub(crate) fn new_with_environment(environment: DocModule) -> anyhow::Result<Self> {
+        Self::new_with_settings_and_env(None, Some(environment))
     }
 
     fn initialize(mut self, settings: Option<LspServerSettings>) -> anyhow::Result<Self> {
